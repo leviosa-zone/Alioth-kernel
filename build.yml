@@ -1,0 +1,68 @@
+name: LNRKernel
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch LineageOS sm8250
+        default: lineage-23.0
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+      - name: Build
+        run: |
+          set -euo pipefail
+          W=$PWD/work; OUT=$W/out; mkdir -p $W; cd $W
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
+          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/LineageOS/android_kernel_xiaomi_sm8250 kernel
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+
+          cat > kernel/arch/arm64/configs/vendor/lnr-perf.config <<'EOF'
+          CONFIG_LOCALVERSION="-LNRKernel"
+          CONFIG_LTO_CLANG=y
+          CONFIG_THINLTO=y
+          CONFIG_DEBUG_INFO=n
+          EOF
+
+          cat > AnyKernel3/anykernel.sh <<'EOF'
+          properties() { '
+          kernel.string=LNRKernel
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=alioth
+          device.name2=aliothin
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+
+          export PATH="$W/clang/bin:$PATH" ARCH=arm64 SUBARCH=arm64
+          cd kernel
+          MK=(make -j"$(nproc)" O="$OUT" ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
+              OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+              CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
+          "${MK[@]}" vendor/kona-perf_defconfig vendor/debugfs.config vendor/xiaomi/sm8250-common.config vendor/xiaomi/alioth.config vendor/lnr-perf.config
+          "${MK[@]}"
+
+          cd ../AnyKernel3
+          cp "$OUT/arch/arm64/boot/Image" .
+          zip -r9 "$GITHUB_WORKSPACE/LNRKernel-$(date +%Y%m%d).zip" . -x '.git*' 'README.md' '*placeholder' >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LNRKernel
+          path: LNRKernel-*.zip
