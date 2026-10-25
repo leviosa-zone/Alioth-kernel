@@ -27,10 +27,20 @@ jobs:
         run: |
           set -euo pipefail
           NAME="LNRKernel"; [ "$VARIANT" = "PE+" ] && NAME="LNRKernel-PE+"
+          IMG="Alioth.img"; [ "$VARIANT" = "PE+" ] && IMG="Alioth-PE+.img"
           W=$PWD/work; OUT=$W/out; mkdir -p $W; cd $W
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
           git clone --depth=1 -b "$BRANCH" https://github.com/LineageOS/android_kernel_xiaomi_sm8250 kernel
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+
+          # PE+: patch performa dari mengkernel (dicek bersih terhadap lineage-23.0 3a0fc935)
+          if [ "$VARIANT" = "PE+" ]; then
+            for c in d239fe9104241e7d7611459f1966b66ae6ee6707 4cab8bba3ee48bf045d056c894e3762b008b42c0 d2dcedb8581c4ed5ecb20ff688be7a59086d51bb e57c6b1a120570df2a5d75dd9dc9b6d307b53b34; do
+              curl -fsSL "https://github.com/mengkernel/kernel_xiaomi_sm8250/commit/$c.patch" -o "$W/p.patch" \
+                && git -C kernel apply --check "$W/p.patch" && git -C kernel apply "$W/p.patch" \
+                && echo "APPLIED $c" || echo "SKIPPED $c"
+            done
+          fi
 
           # Hapus info builder: user@host, string compiler, hash git
           export KBUILD_BUILD_USER=LNR KBUILD_BUILD_HOST=LNR
@@ -76,6 +86,7 @@ jobs:
           RAMDISK_COMPRESSION=auto;
           PATCH_VBMETA_FLAG=auto;
           . tools/ak3-core.sh;
+          mv -f "\$AKHOME/$IMG" "\$AKHOME/Image";
           split_boot;
           flash_boot;
           EOF
@@ -90,10 +101,9 @@ jobs:
           "${MK[@]}"
 
           cd ../AnyKernel3
-          cp "$OUT/arch/arm64/boot/Image" .
+          cp "$OUT/arch/arm64/boot/Image" "$IMG"
           zip -r9 "$GITHUB_WORKSPACE/$NAME-$(date +%Y%m%d).zip" . -x '.git*' 'README.md' '*placeholder' >/dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: LNRKernel
           path: LNRKernel*.zip
-          
