@@ -5,6 +5,13 @@ on:
       branch:
         description: Branch LineageOS sm8250
         default: lineage-23.0
+      variant:
+        description: Varian
+        type: choice
+        default: standard
+        options:
+          - standard
+          - PE+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -14,23 +21,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
       - name: Build
+        env:
+          VARIANT: ${{ inputs.variant }}
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
+          NAME="LNRKernel"; [ "$VARIANT" = "PE+" ] && NAME="LNRKernel-PE+"
           W=$PWD/work; OUT=$W/out; mkdir -p $W; cd $W
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
-          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/LineageOS/android_kernel_xiaomi_sm8250 kernel
+          git clone --depth=1 -b "$BRANCH" https://github.com/LineageOS/android_kernel_xiaomi_sm8250 kernel
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
 
-          cat > kernel/arch/arm64/configs/vendor/lnr-perf.config <<'EOF'
-          CONFIG_LOCALVERSION="-LNRKernel"
+          # Hapus info builder: user@host, string compiler, hash git
+          export KBUILD_BUILD_USER=LNR KBUILD_BUILD_HOST=LNR
+          sed -i 's/\$CC_VERSION, \$LD_VERSION/LNR clang/' kernel/scripts/mkcompile_h
+          grep -q 'LNR clang' kernel/scripts/mkcompile_h
+          : > kernel/.scmversion
+
+          cat > kernel/arch/arm64/configs/vendor/lnr-perf.config <<EOF
+          CONFIG_LOCALVERSION="-$NAME"
           CONFIG_LTO_CLANG=y
           CONFIG_THINLTO=y
           CONFIG_DEBUG_INFO=n
           EOF
 
-          cat > AnyKernel3/anykernel.sh <<'EOF'
+          KC=""
+          if [ "$VARIANT" = "PE+" ]; then
+            cat >> kernel/arch/arm64/configs/vendor/lnr-perf.config <<'EOF'
+          # CONFIG_SCHEDSTATS is not set
+          # CONFIG_SCHED_STACK_END_CHECK is not set
+          # CONFIG_INIT_ON_ALLOC_DEFAULT_ON is not set
+          # CONFIG_HARDENED_USERCOPY is not set
+          # CONFIG_SLAB_FREELIST_HARDENED is not set
+          EOF
+            KC="-O3"
+          fi
+
+          cat > AnyKernel3/anykernel.sh <<EOF
           properties() { '
-          kernel.string=LNRKernel
+          kernel.string=$NAME
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -56,13 +85,15 @@ jobs:
           MK=(make -j"$(nproc)" O="$OUT" ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
               OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
+          [ -n "$KC" ] && MK+=(KCFLAGS="$KC")
           "${MK[@]}" vendor/kona-perf_defconfig vendor/debugfs.config vendor/xiaomi/sm8250-common.config vendor/xiaomi/alioth.config vendor/lnr-perf.config
           "${MK[@]}"
 
           cd ../AnyKernel3
           cp "$OUT/arch/arm64/boot/Image" .
-          zip -r9 "$GITHUB_WORKSPACE/LNRKernel-$(date +%Y%m%d).zip" . -x '.git*' 'README.md' '*placeholder' >/dev/null
+          zip -r9 "$GITHUB_WORKSPACE/$NAME-$(date +%Y%m%d).zip" . -x '.git*' 'README.md' '*placeholder' >/dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: LNRKernel
-          path: LNRKernel-*.zip
+          path: LNRKernel*.zip
+          
