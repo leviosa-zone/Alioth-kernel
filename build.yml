@@ -1,13 +1,22 @@
 name: LNRKernel
 
+# Source: NoGravityKernel (NGK) sm8250 untuk POCO F3 (alioth), dibuild lewat
+# compile-alioth.sh bawaan NGK (GPU dtsi, firmware touch, dtb, dtbo AOSP + MIUI).
+# Hasil: dua zip terpisah, tanpa pilihan tombol saat flash:
+#   LNRKernel-<tanggal>-nonksu.zip  -> tanpa KernelSU (Magisk tetap utuh kalau ada)
+#   LNRKernel-<tanggal>-ksun.zip    -> KernelSU Next
+
 on:
   workflow_dispatch:
     inputs:
+      repo:
+        description: Repo source kernel (owner/nama)
+        default: Pierre2324/NGK_android_kernel_xiaomi_sm8250
       branch:
-        description: Branch kernel sm8250
-        default: lineage-23.0
+        description: Branch source kernel
+        default: t-caf
       ksu_ref:
-        description: Ref KernelSU Next untuk varian KSU (branch, tag, atau commit)
+        description: Ref KernelSU Next untuk zip KSUN (branch, tag, atau commit)
         default: legacy
       kcflags:
         description: Flag compiler tambahan (kosongkan kalau build error)
@@ -36,7 +45,6 @@ jobs:
     env:
       VARIANT: ${{ matrix.variant }}
       W: ${{ github.workspace }}/work
-      OUT: ${{ github.workspace }}/work/out
     steps:
       - name: Install dependencies
         run: |
@@ -69,13 +77,21 @@ jobs:
 
       - name: Source kernel
         env:
+          REPO: ${{ inputs.repo }}
           BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
           mkdir -p "$W"
-          git clone --depth=1 -b "${BRANCH:-lineage-23.0}" \
-            https://github.com/LineageOS/android_kernel_xiaomi_sm8250 "$W/kernel"
-          cat > "$W/kernel/arch/arm64/configs/vendor/lnr-perf.config" <<'EOF'
+          git clone --depth=1 -b "${BRANCH:-t-caf}" \
+            "https://github.com/${REPO:-Pierre2324/NGK_android_kernel_xiaomi_sm8250}" "$W/kernel"
+          cd "$W/kernel"
+          test -f compile-alioth.sh || { echo "::error::compile-alioth.sh tidak ada di branch ini"; exit 1; }
+          test -f arch/arm64/configs/nogravity-alioth_defconfig || { echo "::error::nogravity-alioth_defconfig tidak ada"; exit 1; }
+
+          # Tambahan config LNR ditempel di akhir defconfig (baris terakhir menang)
+          printf '\n' >> arch/arm64/configs/nogravity-alioth_defconfig
+          cat >> arch/arm64/configs/nogravity-alioth_defconfig <<'EOF'
+          # --- LNRKernel ---
           CONFIG_LOCALVERSION="-LNRKernel"
           # CONFIG_LOCALVERSION_AUTO is not set
           CONFIG_LTO_CLANG=y
@@ -100,7 +116,8 @@ jobs:
           grep -q kernelsu drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           grep -q kernelsu drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-          cat > arch/arm64/configs/vendor/lnr-ksu.config <<'EOF'
+          cat >> arch/arm64/configs/nogravity-alioth_defconfig <<'EOF'
+          # --- LNRKernel: KernelSU Next ---
           CONFIG_LOCALVERSION="-LNRKernel-KSUN"
           CONFIG_KSU=y
           CONFIG_KSU_MANUAL_HOOK=y
@@ -258,7 +275,7 @@ jobs:
                   print("[LNR] hook terpasang:", path)
           PY
 
-      - name: Compile Image (${{ matrix.variant }})
+      - name: Build (${{ matrix.variant }})
         env:
           KCFLAGS: ${{ inputs.kcflags }}
         run: |
@@ -266,19 +283,11 @@ jobs:
           cd "$W/kernel"
           clang --version | head -n1
 
-          MK=(make -j"$(nproc)" O="$OUT" ARCH=arm64 CC="ccache clang" LD=ld.lld AR=llvm-ar
-              NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
-              CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
-          CFG=(vendor/kona-perf_defconfig vendor/debugfs.config vendor/xiaomi/sm8250-common.config
-               vendor/xiaomi/alioth.config vendor/lnr-perf.config)
-          if [ "$VARIANT" = ksu ]; then CFG+=(vendor/lnr-ksu.config); fi
-          ccache -z
-
-          echo "::group::Banner kernel: clang tetap tampil, bertanda LNR"
+          # ---- banner: versi clang tetap tampil, bertanda LNR ----
           CLANG_V=$(clang --version | sed -n '1s/.*clang version \([0-9][0-9.]*\).*/\1/p')
           LLD_V=$(ld.lld --version | sed -n '1s/.*LLD \([0-9][0-9.]*\).*/\1/p')
           export LNR_CC="LNR clang version ${CLANG_V:-unknown}, LLD ${LLD_V:-unknown}"
-          python3 - <<'PY'
+          cat > "$W/banner.py" <<'PY'
           import os, re, pathlib
           p = pathlib.Path("scripts/mkcompile_h")
           s = p.read_text()
@@ -291,13 +300,46 @@ jobs:
           else:
               print("::warning::LINUX_COMPILER tidak ketemu di scripts/mkcompile_h, string clang tetap bawaan")
           PY
-          echo "::endgroup::"
+          if grep -q KBUILD_COMPILER_STRING scripts/mkcompile_h; then
+            echo "[LNR] mkcompile_h mendukung KBUILD_COMPILER_STRING -> $LNR_CC"
+          else
+            python3 "$W/banner.py"
+          fi
 
+          # ---- compile-alioth.sh bawaan NGK, dengan path toolchain dan identitas LNR ----
+          if [ -x "$HOME/lnr-clang/bin/aarch64-linux-gnu-ld" ]; then
+            P64="$HOME/lnr-clang/bin/aarch64-linux-gnu-"; P32="$HOME/lnr-clang/bin/arm-linux-gnueabi-"
+          else
+            P64=aarch64-linux-gnu-; P32=arm-linux-gnueabi-
+          fi
+          S=lnr-build.sh
+          cp compile-alioth.sh "$S"
+          sed -i \
+            -e "s|^COMPILERDIR=.*|COMPILERDIR=\"$HOME/lnr-clang\"|" \
+            -e 's|^COMPILER=.*|COMPILER="ccache clang"|' \
+            -e 's|CC=\${COMPILER}|CC="${COMPILER}"|g' \
+            -e "s|\${COMPILERDIR}/bin/aarch64-linux-gnu-|$P64|g" \
+            -e "s|\${COMPILERDIR}/bin/arm-linux-gnueabi-|$P32|g" \
+            -e '/^export KBUILD_BUILD_USER=/d' \
+            -e '/^export KBUILD_BUILD_HOST=/d' \
+            -e 's|KBUILD_COMPILER_STRING="[^"]*"|KBUILD_COMPILER_STRING="${LNR_CC}"|' \
+            "$S"
+          chk() { grep -qE "$1" "$S" || { echo "::error::patch compile-alioth.sh gagal ($1), format script berubah?"; exit 1; }; }
+          chk '^COMPILER="ccache clang"'
+          chk "^COMPILERDIR=\"$HOME/lnr-clang\""
+          chk 'KBUILD_COMPILER_STRING="\$\{LNR_CC\}"'
+          if grep -qE '^export KBUILD_BUILD_(USER|HOST)=' "$S"; then echo "::error::export KBUILD_BUILD_* masih ada"; exit 1; fi
+          sh -n "$S"
+
+          # ---- cek config ----
+          MK=(make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang"
+              CROSS_COMPILE="$P64" CROSS_COMPILE_COMPAT="$P32" LD=ld.lld AR=llvm-ar NM=llvm-nm
+              OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip ld-name=lld)
           echo "::group::Defconfig"
-          "${MK[@]}" "${CFG[@]}"
-          chk() { grep -q "^$1\$" "$OUT/.config" || { echo "::error::$1 tidak masuk .config (symbol Kconfig berubah?)"; exit 1; }; }
-          if [ "$VARIANT" = ksu ]; then chk CONFIG_KSU=y; chk CONFIG_KSU_MANUAL_HOOK=y; fi
-          grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG|THINLTO|CFI_CLANG|SHADOW_CALL_STACK|KSU)' "$OUT/.config" || true
+          "${MK[@]}" nogravity-alioth_defconfig
+          cfg() { grep -q "^$1\$" out/.config || { echo "::error::$1 tidak masuk .config (symbol Kconfig berubah?)"; exit 1; }; }
+          if [ "$VARIANT" = ksu ]; then cfg CONFIG_KSU=y; cfg CONFIG_KSU_MANUAL_HOOK=y; fi
+          grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG|THINLTO|CFI_CLANG|SHADOW_CALL_STACK|KSU)' out/.config || true
           echo "::endgroup::"
 
           if [ "$VARIANT" = ksu ]; then
@@ -309,101 +351,115 @@ jobs:
             echo "::endgroup::"
           fi
 
-          echo "::group::Compile"
-          "${MK[@]}" Image
-          echo "::endgroup::"
+          # ---- build (script NGK tidak mengembalikan exit code error, jadi hasilnya dicek manual) ----
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch kernel sm8250
+        default: lineage-23.0
+      ksu_ref:
+        description: Ref KernelSU Next untuk varian KSU (branch, tag, atau commit)
+        default: legacy
+      kcflags:
+        description: Flag compiler tambahan (kosongkan kalau build error)
+        default: "-O3"
 
-          mkdir -p "${GITHUB_WORKSPACE}/dist"
-          install -m 644 "$OUT/arch/arm64/boot/Image" "${GITHUB_WORKSPACE}/dist/Image"
-          ls -lh "${GITHUB_WORKSPACE}/dist/Image"
+env:
+  # Identitas di /proc/version:
+  #   Linux version 4.19.x-LNRKernel (LNR@LNRKernel) (LNR clang version X, LLD X) ...
+  KBUILD_BUILD_USER: LNR
+  KBUILD_BUILD_HOST: LNRKernel
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+  # ganti string ini kalau toolchain diganti, supaya cache lama tidak terpakai
+  CCACHE_COMPILERCHECK: "string:proton-clang"
+  CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
 
-          grep -E 'LINUX_COMPILE_BY|LINUX_COMPILE_HOST|LINUX_COMPILER|UTS_RELEASE' \
-            "$OUT/include/generated/compile.h" "$OUT/include/generated/utsrelease.h" || true
-          if grep -qi lineage "$OUT/include/generated/compile.h" "$OUT/include/generated/utsrelease.h"; then
-            echo "::warning::masih ada kata lineage di banner kernel"
-          fi
-          ccache -s
-
-      - name: Upload Image
-        uses: actions/upload-artifact@v4
-        with:
-          name: image-${{ matrix.variant }}
-          path: dist/Image
-          retention-days: 1
-          if-no-files-found: error
-
-  package:
-    name: Package zip
-    needs: build
+jobs:
+  build:
+    name: Build ${{ matrix.variant }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [stock, ksu]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      W: ${{ github.workspace }}/work
+      OUT: ${{ github.workspace }}/work/out
     steps:
-      - name: Download Image
-        uses: actions/download-artifact@v4
-        with:
-          pattern: image-*
-          path: images
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev zip ccache \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Buat zip AnyKernel3
+      - name: Cache toolchain
+        id: clang_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/lnr-clang
+          key: lnr-proton-clang-v1
+
+      - name: Fetch toolchain
+        if: steps.clang_cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang ~/lnr-clang
+          rm -rf ~/lnr-clang/.git
+
+      - name: Toolchain PATH
+        run: echo "$HOME/lnr-clang/bin" >> "$GITHUB_PATH"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.variant }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.variant }}-
+
+      - name: Source kernel
+        env:
+          BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
-          mkdir -p AnyKernel3/variants/stock AnyKernel3/variants/ksu
-          cp images/image-stock/Image AnyKernel3/variants/stock/Image
-          cp images/image-ksu/Image AnyKernel3/variants/ksu/Image
+          mkdir -p "$W"
+          git clone --depth=1 -b "${BRANCH:-lineage-23.0}" \
+            https://github.com/LineageOS/android_kernel_xiaomi_sm8250 "$W/kernel"
+          cat > "$W/kernel/arch/arm64/configs/vendor/lnr-perf.config" <<'EOF'
+          CONFIG_LOCALVERSION="-LNRKernel"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          CONFIG_LTO_CLANG=y
+          CONFIG_THINLTO=y
+          CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+          # CONFIG_CC_OPTIMIZE_FOR_SIZE is not set
+          # CONFIG_DEBUG_INFO is not set
+          EOF
 
-          cat > AnyKernel3/anykernel.sh <<'EOF'
-          ### AnyKernel3 - LNRKernel (alioth)
-          ## Volume Atas = STOCK (tanpa root bawaan, Magisk tetap utuh)
-          ## Volume Bawah = KernelSU Next
+      - name: Integrasi KernelSU Next (manual hook)
+        if: matrix.variant == 'ksu'
+        env:
+          KSU_REF: ${{ inputs.ksu_ref }}
+        run: |
+          set -euo pipefail
+          git clone -b legacy https://github.com/KernelSU-Next/KernelSU-Next "$W/KernelSU-Next"
+          git -C "$W/KernelSU-Next" checkout "${KSU_REF:-legacy}"
+          git -C "$W/KernelSU-Next" log -1 --format='KernelSU Next: %h %s'
 
-          properties() { '
-          kernel.string=LNRKernel
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=0
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=alioth
-          device.name2=aliothin
-          supported.versions=
-          supported.patchlevels=
-          supported.vendorpatchlevels=
-          '; } # end properties
+          cd "$W/kernel"
+          ln -sfn ../../KernelSU-Next/kernel drivers/kernelsu
+          grep -q kernelsu drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q kernelsu drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-          BLOCK=/dev/block/bootdevice/by-name/boot;
-          IS_SLOT_DEVICE=auto;
-          RAMDISK_COMPRESSION=auto;
-          PATCH_VBMETA_FLAG=auto;
+          cat > arch/arm64/configs/vendor/lnr-ksu.config <<'EOF'
+          CONFIG_LOCALVERSION="-LNRKernel-KSUN"
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          # CONFIG_KSU_SYSCALL_TABLE_HOOK is not set
+          CONFIG_OVERLAY_FS=y
 
-          . tools/ak3-core.sh;
-
-          ### ---- LNR: pilih varian lewat tombol volume ----
-          LNR_HOME=${AKHOME:-${home:-$PWD}};
-          LNR_EVT=$LNR_HOME/.lnr_evt;
-
-          # lnr_key <detik> -> LNR_KEY=up|down ; return 1 kalau tidak ada input
-          lnr_key() {
-            LNR_KEY=none;
-            command -v getevent >/dev/null 2>&1 || return 1;
-            _end=$(( $(date +%s) + $1 ));
-            while [ $(date +%s) -lt $_end ]; do
-              : > $LNR_EVT;
-              getevent -lqc 1 > $LNR_EVT 2>/dev/null &
-              _pid=$!;
-              _n=0;
-              while [ $_n -lt 10 ] && kill -0 $_pid 2>/dev/null; do
-                sleep 0.1 2>/dev/null || { sleep 1; _n=10; };
-                _n=$((_n + 1));
-              done;
-              kill $_pid 2>/dev/null;
-              wait $_pid 2>/dev/null;
-              if grep -qE 'KEY_VOLUMEUP[[:space:]]+DOWN' $LNR_EVT; then LNR_KEY=up; return 0; fi;
-              if grep -qE 'KEY_VOLUMEDOWN[[:space:]]+DOWN' $LNR_EVT; then LNR_KEY=down; return 0; fi;
-            done;
-            return 1;
-          }
-
-          # lnr_magisk -> return 0 kalau boot ramdisk (atau /data) menunjukkan Magisk
           lnr_magisk() {
             _sp=${SPLITIMG:-${split_img:-$LNR_HOME/split_img}};
             _bn=${BIN:-${bin:-$LNR_HOME/tools}};
@@ -419,47 +475,10 @@ jobs:
             return 1;
           }
 
-          ui_print " ";
-          ui_print "=== LNRKernel ===";
-          ui_print "Volume Atas  : STOCK (tanpa root bawaan)";
-          ui_print "Volume Bawah : KernelSU Next";
-          ui_print "Tanpa input 15 detik = STOCK";
-
-          LNR_VARIANT=stock;
-          if lnr_key 15; then
-            case $LNR_KEY in down) LNR_VARIANT=ksu;; esac;
-          else
-            ui_print "Tombol tidak terdeteksi -> STOCK";
-          fi;
-
-          case $LNR_VARIANT in
-            ksu) ui_print "Varian: KernelSU Next"; cp -f $LNR_HOME/variants/ksu/Image $LNR_HOME/Image;;
-            *)   ui_print "Varian: STOCK";         cp -f $LNR_HOME/variants/stock/Image $LNR_HOME/Image;;
-          esac;
-          [ -s $LNR_HOME/Image ] || abort "Image varian tidak ditemukan. Aborting...";
-
-          # ramdisk tidak dibongkar/diubah -> Magisk (kalau ada) tetap utuh
-          split_boot;
-
-          if lnr_magisk; then
-            ui_print "Magisk terdeteksi";
-            if [ "$LNR_VARIANT" = ksu ]; then
-              ui_print "! KSU dan Magisk bisa bentrok.";
-              ui_print "! Sebaiknya uninstall Magisk dulu.";
-            else
-              ui_print "Root Magisk dipertahankan.";
-            fi;
-          fi;
-
-          flash_boot;
-          ## end boot install
-          EOF
-
-          cd AnyKernel3
-          zip -r9 "$GITHUB_WORKSPACE/LNRKernel-$(date +%Y%m%d).zip" . -x '.git*' 'README.md' '*placeholder'
-
-      - name: Upload zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: LNRKernel
-          path: LNRKernel-*.zip
+          # lnr_rom -> LNR_ROM=miui | aosp | none (none = build.prop tidak terbaca)
+          lnr_rom() {
+            LNR_ROM=none;
+            for _f in $LNR_PROPS; do
+              [ -f $_f ] || continue;
+              [ "$LNR_ROM" = none ] && LNR_ROM=aosp;
+              if grep -qE '^ro\.(miui\.ui\.version\.(name|code)|mi\.os\.version\.name)=' $_f; then LNR_ROM=miui; 
