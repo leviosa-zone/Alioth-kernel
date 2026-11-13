@@ -259,9 +259,13 @@ jobs:
             # Kbuild KernelSU Next menyuntik backport (path_umount dan sejenisnya) ke fs/ saat Makefile
             # drivers/kernelsu dibaca. Dibaca duluan di sini supaya injeksi pasti selesai
             # sebelum fs/ dikompilasi.
+            # flask.h / av_permissions.h (hasil genheaders) dibuat oleh security/selinux/,
+            # dan dibutuhkan objsec.h yang di-include KernelSU. Jadi selinux dibuild dulu.
             echo "::group::KSU: pre-trigger Kbuild"
+            "${MK[@]}" security/selinux/
             "${MK[@]}" drivers/kernelsu/
             echo "::endgroup::"
+            grep -q 'path_umount' fs/internal.h || { echo "::error::injeksi backport KSU Next ke fs/ tidak terjadi"; exit 1; }
           fi
 
           # ---- build (script NGK tidak mengembalikan exit code error, jadi hasilnya dicek manual) ----
