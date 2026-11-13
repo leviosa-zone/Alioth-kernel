@@ -5,6 +5,10 @@ name: LNRKernel
 # Hasil: dua zip terpisah, tanpa pilihan tombol saat flash:
 #   LNRKernel-<tanggal>-nonksu.zip  -> tanpa KernelSU (Magisk tetap utuh kalau ada)
 #   LNRKernel-<tanggal>-ksun.zip    -> KernelSU Next
+#
+# Catatan source NGK: drivers/kernelsu adalah symlink rusak ke path lokal pembuatnya,
+# dan hook ksu_handle_* terpasang tanpa #ifdef. Step "Source kernel" membersihkan
+# itu dan membungkus hook dengan CONFIG_KSU, jadi varian stock benar-benar bersih.
 
 on:
   workflow_dispatch:
@@ -32,6 +36,7 @@ env:
   # ganti string ini kalau toolchain diganti, supaya cache lama tidak terpakai
   CCACHE_COMPILERCHECK: "string:proton-clang"
   CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
@@ -88,6 +93,24 @@ jobs:
           test -f compile-alioth.sh || { echo "::error::compile-alioth.sh tidak ada di branch ini"; exit 1; }
           test -f arch/arm64/configs/nogravity-alioth_defconfig || { echo "::error::nogravity-alioth_defconfig tidak ada"; exit 1; }
 
+          # ---- bersihkan KernelSU bawaan source NGK ----
+          # drivers/kernelsu = symlink rusak ke path lokal; Kconfig dan Makefile memanggilnya
+          # tanpa syarat, itu penyebab "can't open file drivers/kernelsu/Kconfig".
+          rm -f drivers/kernelsu
+          sed -i '/drivers\/kernelsu\/Kconfig/d' drivers/Kconfig
+          sed -i '/kernelsu\//d' drivers/Makefile
+          if grep -rn 'kernelsu' drivers/Kconfig drivers/Makefile; then
+            echo "::error::sisa referensi kernelsu masih ada"; exit 1
+          fi
+
+          # Hook ksu_handle_* bawaan NGK tidak dibungkus #ifdef, jadi tanpa KernelSU
+          # kernel gagal link. Bungkus dengan CONFIG_KSU (stock: mati, ksu: aktif).
+          for f in fs/exec.c fs/open.c fs/stat.c fs/read_write.c drivers/input/input.c; do
+            sed -i -E 's/^([[:space:]]+ksu_handle_[a-z_]+\(.*\);)$/#ifdef CONFIG_KSU\n\1\n#endif/' "$f"
+            n=$(grep -c '^#ifdef CONFIG_KSU$' "$f" || true)
+            [ "$n" = 1 ] || { echo "::error::hook di $f ada $n (harusnya 1), source berubah?"; exit 1; }
+          done
+
           # Tambahan config LNR ditempel di akhir defconfig (baris terakhir menang)
           printf '\n' >> arch/arm64/configs/nogravity-alioth_defconfig
           cat >> arch/arm64/configs/nogravity-alioth_defconfig <<'EOF'
@@ -115,6 +138,7 @@ jobs:
           ln -sfn ../../KernelSU-Next/kernel drivers/kernelsu
           grep -q kernelsu drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           grep -q kernelsu drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          test -f drivers/kernelsu/Kconfig || { echo "::error::drivers/kernelsu/Kconfig tidak terbaca"; exit 1; }
 
           cat >> arch/arm64/configs/nogravity-alioth_defconfig <<'EOF'
           # --- LNRKernel: KernelSU Next ---
@@ -126,153 +150,38 @@ jobs:
           CONFIG_OVERLAY_FS=y
           EOF
 
-          # Pasang hook manual KernelSU Next ke source kernel (4.19 non-GKI).
-          # Sengaja gagal keras kalau bentuk source tidak cocok, supaya tidak
-          # menghasilkan kernel "KSU" yang diam-diam tidak berfungsi.
-          KSU_DIR="$W/KernelSU-Next/kernel" python3 - <<'PY'
-          import os, re, sys, pathlib
+          # Hook execveat, faccessat, stat, vfs_read, dan input sudah ada di source NGK
+          # (sudah dibungkus CONFIG_KSU di step sebelumnya). setresuid ditangani lewat LSM
+          # hook milik KernelSU Next. Yang kurang hanya hook reboot (jalur install manager).
+          # Gagal keras kalau bentuk source tidak cocok, supaya tidak menghasilkan
+          # kernel "KSU" yang diam-diam tidak berfungsi.
+          nm=$(grep -rhoE 'ksu_handle_(execveat|faccessat|stat|vfs_read|sys_reboot)\b|ksu_handle_input_handle_event' drivers/kernelsu/ | sort -u | tr '\n' ' ')
+          echo "[LNR] simbol hook di KernelSU Next: $nm"
+          for s in ksu_handle_execveat ksu_handle_faccessat ksu_handle_stat ksu_handle_vfs_read ksu_handle_input_handle_event ksu_handle_sys_reboot; do
+            case " $nm " in *" $s "*) ;; *) echo "::error::KernelSU Next ref ini tidak punya $s"; exit 1;; esac
+          done
 
-          T = "\t"
-          KSU = pathlib.Path(os.environ["KSU_DIR"])
-          blob = "\n".join(p.read_text(errors="ignore") for p in KSU.rglob("*") if p.suffix in (".c", ".h"))
+          python3 - <<'PY'
+          import pathlib, sys
 
-          need = ["ksu_handle_execveat", "ksu_handle_faccessat", "ksu_handle_stat",
-                  "ksu_handle_sys_read", "ksu_handle_setresuid", "ksu_handle_sys_reboot"]
-          miss = [n for n in need if n not in blob]
-          if miss:
-              sys.exit("[LNR] ref KernelSU Next ini tidak punya hook manual: " + ", ".join(miss))
-          has_read = "ksu_vfs_read_hook" in blob
-          has_input_fn = "ksu_handle_input_handle_event" in blob
-          has_input = "ksu_input_hook" in blob
-
-
-          def blk(*lines):
-              return "#ifdef CONFIG_KSU /* LNR-KSU */\n" + "".join(l + "\n" for l in lines) + "#endif\n"
-
-
-          def body_span(s, sig):
-              m = re.search(sig, s, re.M)
-              if not m:
-                  return None
-              o = re.compile(r"^\{", re.M).search(s, m.end())
-              if not o:
-                  return None
-              i, depth, n = o.start(), 0, len(s)
-              while i < n:
-                  c = s[i]
-                  if s.startswith("/*", i):
-                      i = s.index("*/", i + 2) + 2
-                      continue
-                  if s.startswith("//", i):
-                      i = s.index("\n", i)
-                      continue
-                  if c in "\"'":
-                      i += 1
-                      while s[i] != c:
-                          i += 2 if s[i] == "\\" else 1
-                      i += 1
-                      continue
-                  if c == "{":
-                      depth += 1
-                  elif c == "}":
-                      depth -= 1
-                      if depth == 0:
-                          return m.start(), o.start(), i
-                  i += 1
-              return None
-
-
-          def put(s, sig, anchors, text, decl="", optional=False):
-              sp = body_span(s, sig)
-              if not sp:
-                  if optional:
-                      print("[LNR] lewati (tidak ketemu):", sig)
-                      return s
-                  sys.exit("[LNR] fungsi tidak ketemu: " + sig)
-              start, ob, cb = sp
-              body = s[ob:cb]
-              for a in anchors:
-                  m = re.search(a, body, re.M)
-                  if m:
-                      at = ob + body.rfind("\n", 0, m.start()) + 1
-                      s = s[:at] + text + s[at:]
-                      return s[:start] + decl + s[start:]
-              if optional:
-                  print("[LNR] lewati (anchor tidak ketemu):", sig)
-                  return s
-              sys.exit("[LNR] anchor tidak ketemu di %s: %s" % (sig, anchors))
-
-
-          def exec_c(s):
-              wrapper = re.search(r"^static int __do_execve_file\(", s, re.M)
-              anchor = r"^\treturn __do_execve_file\(" if wrapper else r"^\tif \(IS_ERR\(filename\)\)"
-              return put(s, r"^static int do_execveat_common\(", [anchor], blk(
-                  T + "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);",
-                  T + "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"))
-
-
-          def open_c(s):
-              return put(s, r"^SYSCALL_DEFINE3\(faccessat,", [r"^\tif \(mode & ~S_IRWXO\)"], blk(
-                  T + "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);",
-                  T + "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"))
-
-
-          def stat_c(s):
-              return put(s, r"^(?:static\s+)?(?:inline\s+)?int vfs_statx\(", [r"^\tif \(\(flags & ~\("], blk(
-                  T + "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);",
-                  T + "ksu_handle_stat(&dfd, &filename, &flags);"))
-
-
-          def read_c(s):
-              fn = "extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);"
-              if has_read:
-                  decl = blk("extern bool ksu_vfs_read_hook __read_mostly;", fn)
-                  hook = blk(T + "if (unlikely(ksu_vfs_read_hook))", T + T + "ksu_handle_sys_read(fd, &buf, &count);")
-              else:
-                  decl = blk(fn)
-                  hook = blk(T + "ksu_handle_sys_read(fd, &buf, &count);")
-              return put(s, r"^SYSCALL_DEFINE3\(read,", [r"^\tif \(f\.file\) \{", r"^\treturn ksys_read\("], hook, decl)
-
-
-          def sys_c(s):
-              return put(s, r"^SYSCALL_DEFINE3\(setresuid,", [r"^\tkruid = make_kuid\(ns, ruid\);"], blk(
-                  T + "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);",
-                  T + "ksu_handle_setresuid(ruid, euid, suid);"))
-
-
-          def reboot_c(s):
-              return put(s, r"^SYSCALL_DEFINE4\(reboot,",
-                         [r"^\t/\* We only trust the superuser with rebooting the system\. \*/"], blk(
-                  T + "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);",
-                  T + "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"))
-
-
-          def input_c(s):
-              if not has_input_fn:
-                  return s
-              fn = "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);"
-              if has_input:
-                  decl = blk("extern bool ksu_input_hook __read_mostly;", fn)
-                  hook = blk(T + "if (unlikely(ksu_input_hook))", T + T + "ksu_handle_input_handle_event(&type, &code, &value);")
-              else:
-                  decl = blk(fn)
-                  hook = blk(T + "ksu_handle_input_handle_event(&type, &code, &value);")
-              return put(s, r"^static void input_handle_event\(", [r"^\tif \(disposition != INPUT_IGNORE_EVENT"],
-                         hook, decl, optional=True)
-
-
-          for path, fn in [("fs/exec.c", exec_c), ("fs/open.c", open_c), ("fs/stat.c", stat_c),
-                           ("fs/read_write.c", read_c), ("kernel/sys.c", sys_c),
-                           ("kernel/reboot.c", reboot_c), ("drivers/input/input.c", input_c)]:
-              p = pathlib.Path(path)
-              s = p.read_text(encoding="utf-8", errors="surrogateescape")
-              if "LNR-KSU" in s:
-                  print("[LNR] sudah dipatch:", path)
-                  continue
-              n = fn(s)
-              if n != s:
-                  p.write_text(n, encoding="utf-8", errors="surrogateescape")
-                  print("[LNR] hook terpasang:", path)
+          p = pathlib.Path("kernel/reboot.c")
+          s = p.read_text(encoding="utf-8", errors="surrogateescape")
+          anchor = "\tint ret = 0;\n\n\tif (check_poweroff_charger_mode()){"
+          if "LNR-KSU" in s:
+              print("[LNR] sudah dipatch: kernel/reboot.c")
+          elif s.count(anchor) != 1:
+              sys.exit("[LNR] anchor SYSCALL_DEFINE4(reboot) tidak ketemu di kernel/reboot.c")
+          else:
+              hook = ("\tint ret = 0;\n"
+                      "#ifdef CONFIG_KSU /* LNR-KSU */\n"
+                      "\t{\n"
+                      "\t\textern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"
+                      "\t\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+                      "\t}\n"
+                      "#endif\n\n"
+                      "\tif (check_poweroff_charger_mode()){")
+              p.write_text(s.replace(anchor, hook), encoding="utf-8", errors="surrogateescape")
+              print("[LNR] hook terpasang: kernel/reboot.c")
           PY
 
       - name: Build (${{ matrix.variant }})
@@ -338,7 +247,11 @@ jobs:
           echo "::group::Defconfig"
           "${MK[@]}" nogravity-alioth_defconfig
           cfg() { grep -q "^$1\$" out/.config || { echo "::error::$1 tidak masuk .config (symbol Kconfig berubah?)"; exit 1; }; }
-          if [ "$VARIANT" = ksu ]; then cfg CONFIG_KSU=y; cfg CONFIG_KSU_MANUAL_HOOK=y; fi
+          if [ "$VARIANT" = ksu ]; then
+            cfg CONFIG_KSU=y; cfg CONFIG_KSU_MANUAL_HOOK=y
+          else
+            if grep -q '^CONFIG_KSU=' out/.config; then echo "::error::varian stock masih punya CONFIG_KSU"; exit 1; fi
+          fi
           grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG|THINLTO|CFI_CLANG|SHADOW_CALL_STACK|KSU)' out/.config || true
           echo "::endgroup::"
 
@@ -352,45 +265,40 @@ jobs:
           fi
 
           # ---- build (script NGK tidak mengembalikan exit code error, jadi hasilnya dicek manual) ----
-          echo "::group::Compile"
-          ccache -z
+          echo "::group::Build kernel"
+          ccache -z >/dev/null 2>&1 || true
           set +e
           sh "./$S" 2>&1 | tee "$W/build.log"
           set -e
           echo "::endgroup::"
+          ccache -s || true
 
           O=out/outputs/alioth
-          for f in Image.gz dtb dtbo.img; do
-            if [ ! -s "$O/$f" ]; then
-              echo "::error::$f tidak terbentuk, build gagal"
-              tail -n 80 "$W/build.log"
-              exit 1
-            fi
+          for f in dtb dtbo.img Image.gz; do
+            test -s "$O/$f" || { echo "::error::$O/$f tidak ada, build gagal (lihat log)"; grep -nE 'error:|Error [0-9]' "$W/build.log" | head -20 || true; exit 1; }
           done
-          if [ ! -s "$O/alioth_dtbo-miui.img" ]; then echo "::warning::dtbo MIUI tidak terbentuk"; fi
-
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp "$O/Image.gz" "$GITHUB_WORKSPACE/dist/"
-          if [ "$VARIANT" = stock ]; then
-            cp "$O/dtb" "$O/dtbo.img" "$GITHUB_WORKSPACE/dist/"
-            if [ -s "$O/alioth_dtbo-miui.img" ]; then cp "$O/alioth_dtbo-miui.img" "$GITHUB_WORKSPACE/dist/"; fi
+          if [ ! -s "$O/alioth_dtbo-miui.img" ]; then
+            echo "::warning::dtbo MIUI tidak terbentuk, zip hanya membawa dtbo AOSP"
           fi
-          ls -lh "$GITHUB_WORKSPACE/dist"
-
-          H=out/include/generated
-          grep -E 'LINUX_COMPILE_BY|LINUX_COMPILE_HOST|LINUX_COMPILER|UTS_RELEASE' "$H/compile.h" "$H/utsrelease.h" || true
-          if grep -qiE 'lineage|pierre|nogravity|proton' "$H/compile.h" "$H/utsrelease.h"; then
-            echo "::warning::masih ada nama lain di banner kernel"
-          fi
-          ccache -s
+          strings "$O/Image.gz" >/dev/null 2>&1 || true
+          ls -l "$O"
 
       - name: Upload hasil build
         uses: actions/upload-artifact@v4
         with:
           name: out-${{ matrix.variant }}
-          path: dist/*
-          retention-days: 1
+          path: ${{ env.W }}/kernel/out/outputs/alioth/*
           if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload log build (kalau gagal)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.variant }}
+          path: ${{ env.W }}/build.log
+          if-no-files-found: ignore
+          retention-days: 3
 
   package:
     name: Package zip
@@ -400,22 +308,22 @@ jobs:
     steps:
       - name: Download hasil build
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: out-*
-          path: images
+          path: out
 
-      - name: Buat zip AnyKernel3
+      - name: Package zip
         run: |
           set -euo pipefail
-          if [ ! -s images/out-stock/Image.gz ]; then echo "::error::build non-KSU gagal, tidak ada zip"; exit 1; fi
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AK3
-          rm -rf AK3/.git
+          sudo apt-get install -y zip >/dev/null
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE ak3/modules ak3/patch ak3/ramdisk
 
-          cat > anykernel.tpl <<'EOF'
-          ### AnyKernel3 - @KSTR@ (alioth)
-
+          cat > ak3/anykernel.sh <<'EOF'
+          ### AnyKernel3 - LNRKernel (POCO F3 / alioth)
           properties() { '
-          kernel.string=@KSTR@
+          kernel.string=LNRKernel by LNR
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -423,42 +331,73 @@ jobs:
           do.cleanuponabort=0
           device.name1=alioth
           device.name2=aliothin
+          device.name3=POCO F3
+          device.name4=Redmi K40
+          device.name5=Mi 11X
           supported.versions=
           supported.patchlevels=
           supported.vendorpatchlevels=
-          '; } # end properties
+          '; }
 
-          BLOCK=/dev/block/bootdevice/by-name/boot;
+          BLOCK=boot;
           IS_SLOT_DEVICE=auto;
           RAMDISK_COMPRESSION=auto;
           PATCH_VBMETA_FLAG=auto;
 
           . tools/ak3-core.sh;
 
-          LNR_VARIANT=@VARIANT@;
-          LNR_HOME=${AKHOME:-${home:-$PWD}};
-          LNR_PROPS=${LNR_PROPS:-"/system/build.prop /system/system/build.prop /system_ext/etc/build.prop /system/system_ext/etc/build.prop /product/etc/build.prop /system/product/etc/build.prop /vendor/build.prop /mi_ext/etc/build.prop"};
+          # Deteksi ROM supaya dtbo yang dipasang cocok (MIUI atau AOSP).
+          # Kalau build.prop tidak terbaca, pakai dtbo AOSP.
+          for m in /system /system_root /vendor /product /system_ext; do
+            mount -o ro $m 2>/dev/null;
+          done;
+          ROM=aosp;
+          for f in /system/build.prop /system/system/build.prop /system_root/system/build.prop \
+                   /vendor/build.prop /product/etc/build.prop /system_ext/etc/build.prop; do
+            [ -f $f ] || continue;
+            if grep -qE '^ro\.(miui\.ui\.version\.(name|code)|mi\.os\.version\.name)=' $f; then ROM=miui; break; fi;
+          done;
+          ui_print "ROM terdeteksi: $ROM";
+          if [ "$ROM" = miui ] && [ -f $home/dtbo-miui.img ]; then
+            mv -f $home/dtbo-miui.img $home/dtbo.img;
+          else
+            rm -f $home/dtbo-miui.img;
+          fi;
 
-          # lnr_magisk -> return 0 kalau boot ramdisk (atau /data) menunjukkan Magisk
-          lnr_magisk() {
-            _sp=${SPLITIMG:-${split_img:-$LNR_HOME/split_img}};
-            _bn=${BIN:-${bin:-$LNR_HOME/tools}};
-            if [ -s $_sp/ramdisk.cpio ] && [ -x $_bn/magiskboot ]; then
-              cp -f $_sp/ramdisk.cpio $LNR_HOME/.lnr_rd;
-              $_bn/magiskboot decompress $LNR_HOME/.lnr_rd $LNR_HOME/.lnr_rd.raw >/dev/null 2>&1 && mv -f $LNR_HOME/.lnr_rd.raw $LNR_HOME/.lnr_rd;
-              $_bn/magiskboot cpio $LNR_HOME/.lnr_rd test >/dev/null 2>&1;
-              _rc=$?;
-              rm -f $LNR_HOME/.lnr_rd $LNR_HOME/.lnr_rd.raw;
-              [ $((_rc & 1)) -eq 1 ] && return 0;
-            fi;
-            [ -d /data/adb/magisk ] || [ -f /data/adb/magisk.db ] && return 0;
-            return 1;
+          # Kernel + dtb (ramdisk tidak diubah, jadi Magisk bawaan boot tetap utuh)
+          dump_boot;
+          write_boot;
+
+          # dtbo
+          if [ -f $home/dtbo.img ]; then
+            flash_generic dtbo;
+          fi;
+          EOF
+
+          D=$(date +%Y%m%d)
+          fail=0
+          mk() { # $1=variant dir  $2=nama zip
+            src="out/out-$1"
+            if [ ! -s "$src/Image.gz" ]; then
+              echo "::error::build $3 gagal, tidak ada zip"; fail=1; return
+            fi
+            rm -rf pkg && cp -r ak3 pkg
+            cp "$src/Image.gz" pkg/Image.gz
+            cp "$src/dtb" pkg/dtb
+            cp "$src/dtbo.img" pkg/dtbo.img
+            [ -s "$src/alioth_dtbo-miui.img" ] && cp "$src/alioth_dtbo-miui.img" pkg/dtbo-miui.img
+            (cd pkg && zip -r9q "../$2" . -x '.*')
+            echo "dibuat: $2"; ls -l "$2"
           }
+          mk stock "LNRKernel-$D-nonksu.zip" non-KSU
+          mk ksu   "LNRKernel-$D-ksun.zip"   KSUN
+          ls *.zip >/dev/null 2>&1 || { echo "::error::tidak ada zip yang terbentuk"; exit 1; }
+          [ "$fail" = 0 ] || echo "::warning::sebagian varian gagal, hanya zip yang berhasil diunggah"
 
-          # lnr_rom -> LNR_ROM=miui | aosp | none (none = build.prop tidak terbaca)
-          lnr_rom() {
-            LNR_ROM=none;
-            for _f in $LNR_PROPS; do
-              [ -f $_f ] || continue;
-              [ "$LNR_ROM" = none ] && LNR_ROM=aosp;
-              if grep -qE '^ro\.(miui\.ui\.version\.(name|code)|mi\.os\.version\.name)=' $_f; then LNR_ROM=miui; 
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: LNRKernel-zip
+          path: LNRKernel-*.zip
+          if-no-files-found: error
+          retention-days: 14
